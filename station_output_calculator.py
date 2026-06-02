@@ -326,7 +326,7 @@ class StationOutputCalculator:
 
     def __init__(self, csv_path, source, model, scenario, shp_path,
                  cfs_dir, output_dir, gcm=None, realization=None, rcm=None,
-                 region=None):
+                 region=None, overwrite=False):
         self.csv_path = csv_path
         self.source = source
         self.model = model
@@ -338,6 +338,7 @@ class StationOutputCalculator:
         self.realization = realization
         self.rcm = rcm
         self.region = region  # BCSD 区域过滤（目录名，如 Germany）
+        self.overwrite = overwrite  # 是否覆盖已有输出文件
 
         # 加载场站数据
         self.stations_df = pd.read_csv(csv_path)
@@ -417,6 +418,12 @@ class StationOutputCalculator:
             if cf_path is None:
                 logger.warning(f"  未找到 CF 文件: {stype}/{model}/{region}/{scenario}")
                 continue
+
+            # 检查输出文件是否已存在
+            out_path = self._get_output_path(stype, region, model, scenario, "bcsd")
+            if self._should_skip(out_path):
+                continue
+
             logger.info(f"  CF 文件: {cf_path}")
 
             # 筛选该国家的场站（根据场站类型）
@@ -450,6 +457,14 @@ class StationOutputCalculator:
 
         for stype in ["solar", "wind"]:
             logger.info(f"===== China {stype} =====")
+
+            # 检查输出文件是否已存在
+            out_path = self._get_output_path(
+                stype, "china", model, scenario, "china"
+            )
+            if self._should_skip(out_path):
+                continue
+
             cf_path = find_cf_file(cfs_dir, "china", stype, model, "china", scenario)
             if cf_path is None:
                 logger.warning(f"  未找到 China CF 文件: {stype}/{model}/{scenario}")
@@ -501,6 +516,15 @@ class StationOutputCalculator:
             for country_name in target_countries:
                 if country_name not in self.country_shapes:
                     continue
+
+                # 检查输出文件是否已存在
+                out_path = self._get_output_path(
+                    stype, country_name, None, scenario, "nam12",
+                    gcm=gcm, realization=realization, rcm=rcm,
+                )
+                if self._should_skip(out_path):
+                    continue
+
                 country_geom = self.country_shapes[country_name]
 
                 stations = self._filter_stations_for_country(
@@ -847,132 +871,164 @@ class StationOutputCalculator:
         os.makedirs(dirname, exist_ok=True)
         return os.path.join(dirname, fname)
 
+    def _should_skip(self, out_path):
+        """判断是否应跳过该输出文件。
+
+        如果 overwrite=False 且文件已存在，则跳过。
+        """
+        if self.overwrite:
+            return False
+        if os.path.isfile(out_path):
+            logger.info(f"  跳过（文件已存在）: {out_path}")
+            return True
+        return False
+
     def _save_output(self, power, stations, stype, region, model,
                      scenario, source, cf_path):
-        """保存出力结果为 NetCDF（BCSD/China 格式）。"""
+        """保存出力结果为 NetCDF（BCSD/China 格式）。
+
+        如果保存过程中出错，会删除已生成的损坏文件。
+        """
         out_path = self._get_output_path(stype, region, model, scenario, source)
         logger.info(f"  保存: {out_path}")
 
-        # 从 CF 文件读取时间信息
-        ds_cf = nc.Dataset(cf_path, "r")
-        times = ds_cf.variables["time"][:]
-        time_units = ds_cf.variables["time"].units
-        ds_cf.close()
+        try:
+            # 从 CF 文件读取时间信息
+            ds_cf = nc.Dataset(cf_path, "r")
+            times = ds_cf.variables["time"][:]
+            time_units = ds_cf.variables["time"].units
+            ds_cf.close()
 
-        n_time, n_stations = power.shape
+            n_time, n_stations = power.shape
 
-        # 创建输出文件
-        ds_out = nc.Dataset(out_path, "w", format="NETCDF4")
+            # 创建输出文件
+            ds_out = nc.Dataset(out_path, "w", format="NETCDF4")
 
-        # 维度
-        ds_out.createDimension("time", n_time)
-        ds_out.createDimension("id", n_stations)
+            # 维度
+            ds_out.createDimension("time", n_time)
+            ds_out.createDimension("id", n_stations)
 
-        # 时间变量
-        time_var = ds_out.createVariable("time", "f8", ("time",))
-        time_var.units = time_units
-        time_var[:] = times
+            # 时间变量
+            time_var = ds_out.createVariable("time", "f8", ("time",))
+            time_var.units = time_units
+            time_var[:] = times
 
-        # 场站坐标
-        lon_var = ds_out.createVariable("station_lon", "f4", ("id",))
-        lon_var.units = "degrees_east"
-        lon_var[:] = stations["lon"].values.astype(np.float32)
+            # 场站坐标
+            lon_var = ds_out.createVariable("station_lon", "f4", ("id",))
+            lon_var.units = "degrees_east"
+            lon_var[:] = stations["lon"].values.astype(np.float32)
 
-        lat_var = ds_out.createVariable("station_lat", "f4", ("id",))
-        lat_var.units = "degrees_north"
-        lat_var[:] = stations["lat"].values.astype(np.float32)
+            lat_var = ds_out.createVariable("station_lat", "f4", ("id",))
+            lat_var.units = "degrees_north"
+            lat_var[:] = stations["lat"].values.astype(np.float32)
 
-        # 场站类型: 0=光伏, 1=风电
-        type_var = ds_out.createVariable("station_type", "i1", ("id",))
-        type_var[:] = np.where(stations["type"] == "solar", 0, 1).astype(np.int8)
+            # 场站类型: 0=光伏, 1=风电
+            type_var = ds_out.createVariable("station_type", "i1", ("id",))
+            type_var[:] = np.where(stations["type"] == "solar", 0, 1).astype(np.int8)
 
-        # 装机容量
-        cap_var = ds_out.createVariable("capacity_gw", "f4", ("id",))
-        cap_var.units = "GW"
-        cap_var[:] = stations["capacity_gw"].values.astype(np.float32)
+            # 装机容量
+            cap_var = ds_out.createVariable("capacity_gw", "f4", ("id",))
+            cap_var.units = "GW"
+            cap_var[:] = stations["capacity_gw"].values.astype(np.float32)
 
-        # 激活年份
-        act_var = ds_out.createVariable("activation_year", "i4", ("id",))
-        act_var.units = "year"
-        act_var.long_name = "场站激活年份（出力从此年开始有效）"
-        act_var[:] = stations["activation_year"].values.astype(np.int32)
+            # 激活年份
+            act_var = ds_out.createVariable("activation_year", "i4", ("id",))
+            act_var.units = "year"
+            act_var.long_name = "场站激活年份（出力从此年开始有效）"
+            act_var[:] = stations["activation_year"].values.astype(np.int32)
 
-        # 出力
-        power_var = ds_out.createVariable(
-            "power", "f4", ("time", "id"),
-            zlib=True, complevel=4, fill_value=np.nan,
-        )
-        power_var.units = "GW"
-        power_var[:] = power
+            # 出力
+            power_var = ds_out.createVariable(
+                "power", "f4", ("time", "id"),
+                zlib=True, complevel=4, fill_value=np.nan,
+            )
+            power_var.units = "GW"
+            power_var[:] = power
 
-        # 全局属性
-        ds_out.region = region
-        ds_out.scenario = scenario
-        ds_out.source_csv = os.path.basename(self.csv_path)
+            # 全局属性
+            ds_out.region = region
+            ds_out.scenario = scenario
+            ds_out.source_csv = os.path.basename(self.csv_path)
 
-        ds_out.close()
-        logger.info(f"  完成: {out_path}")
+            ds_out.close()
+            logger.info(f"  完成: {out_path}")
+
+        except Exception as e:
+            logger.error(f"  保存失败，清理损坏文件: {out_path}\n  错误: {e}")
+            if os.path.isfile(out_path):
+                os.remove(out_path)
+            raise
 
     def _save_output_nam12(self, power, stations, stype, country_name,
                            gcm, realization, rcm, scenario, cf_path):
-        """保存 NAM-12 出力结果为 NetCDF。"""
+        """保存 NAM-12 出力结果为 NetCDF。
+
+        如果保存过程中出错，会删除已生成的损坏文件。
+        """
         out_path = self._get_output_path(
             stype, country_name, None, scenario, "nam12",
             gcm=gcm, realization=realization, rcm=rcm,
         )
         logger.info(f"  保存: {out_path}")
 
-        ds_cf = nc.Dataset(cf_path, "r")
-        times = ds_cf.variables["time"][:]
-        time_units = ds_cf.variables["time"].units
-        ds_cf.close()
+        try:
+            ds_cf = nc.Dataset(cf_path, "r")
+            times = ds_cf.variables["time"][:]
+            time_units = ds_cf.variables["time"].units
+            ds_cf.close()
 
-        n_time, n_stations = power.shape
+            n_time, n_stations = power.shape
 
-        ds_out = nc.Dataset(out_path, "w", format="NETCDF4")
-        ds_out.createDimension("time", n_time)
-        ds_out.createDimension("id", n_stations)
+            ds_out = nc.Dataset(out_path, "w", format="NETCDF4")
+            ds_out.createDimension("time", n_time)
+            ds_out.createDimension("id", n_stations)
 
-        time_var = ds_out.createVariable("time", "f8", ("time",))
-        time_var.units = time_units
-        time_var[:] = times
+            time_var = ds_out.createVariable("time", "f8", ("time",))
+            time_var.units = time_units
+            time_var[:] = times
 
-        lon_var = ds_out.createVariable("station_lon", "f4", ("id",))
-        lon_var.units = "degrees_east"
-        lon_var[:] = stations["lon"].values.astype(np.float32)
+            lon_var = ds_out.createVariable("station_lon", "f4", ("id",))
+            lon_var.units = "degrees_east"
+            lon_var[:] = stations["lon"].values.astype(np.float32)
 
-        lat_var = ds_out.createVariable("station_lat", "f4", ("id",))
-        lat_var.units = "degrees_north"
-        lat_var[:] = stations["lat"].values.astype(np.float32)
+            lat_var = ds_out.createVariable("station_lat", "f4", ("id",))
+            lat_var.units = "degrees_north"
+            lat_var[:] = stations["lat"].values.astype(np.float32)
 
-        type_var = ds_out.createVariable("station_type", "i1", ("id",))
-        type_var[:] = np.where(stations["type"] == "solar", 0, 1).astype(np.int8)
+            type_var = ds_out.createVariable("station_type", "i1", ("id",))
+            type_var[:] = np.where(stations["type"] == "solar", 0, 1).astype(np.int8)
 
-        cap_var = ds_out.createVariable("capacity_gw", "f4", ("id",))
-        cap_var.units = "GW"
-        cap_var[:] = stations["capacity_gw"].values.astype(np.float32)
+            cap_var = ds_out.createVariable("capacity_gw", "f4", ("id",))
+            cap_var.units = "GW"
+            cap_var[:] = stations["capacity_gw"].values.astype(np.float32)
 
-        act_var = ds_out.createVariable("activation_year", "i4", ("id",))
-        act_var.units = "year"
-        act_var.long_name = "场站激活年份（出力从此年开始有效）"
-        act_var[:] = stations["activation_year"].values.astype(np.int32)
+            act_var = ds_out.createVariable("activation_year", "i4", ("id",))
+            act_var.units = "year"
+            act_var.long_name = "场站激活年份（出力从此年开始有效）"
+            act_var[:] = stations["activation_year"].values.astype(np.int32)
 
-        power_var = ds_out.createVariable(
-            "power", "f4", ("time", "id"),
-            zlib=True, complevel=4, fill_value=np.nan,
-        )
-        power_var.units = "GW"
-        power_var[:] = power
+            power_var = ds_out.createVariable(
+                "power", "f4", ("time", "id"),
+                zlib=True, complevel=4, fill_value=np.nan,
+            )
+            power_var.units = "GW"
+            power_var[:] = power
 
-        ds_out.region = country_name
-        ds_out.scenario = scenario
-        ds_out.source_csv = os.path.basename(self.csv_path)
-        ds_out.gcm = gcm
-        ds_out.realization = realization
-        ds_out.rcm = rcm
+            ds_out.region = country_name
+            ds_out.scenario = scenario
+            ds_out.source_csv = os.path.basename(self.csv_path)
+            ds_out.gcm = gcm
+            ds_out.realization = realization
+            ds_out.rcm = rcm
 
-        ds_out.close()
-        logger.info(f"  完成: {out_path}")
+            ds_out.close()
+            logger.info(f"  完成: {out_path}")
+
+        except Exception as e:
+            logger.error(f"  保存失败，清理损坏文件: {out_path}\n  错误: {e}")
+            if os.path.isfile(out_path):
+                os.remove(out_path)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1095,11 @@ python %(prog)s --csv data/stations/stations_SSP5-6.0.csv \\
         help="BCSD 区域名，仅处理指定国家/区域 (如 Germany, China)；"
              "不指定则处理所有区域",
     )
+    # 断点续跑
+    parser.add_argument(
+        "--overwrite", action="store_true", default=False,
+        help="覆盖已有输出文件（默认不覆盖，跳过已存在的文件以支持断点续跑）",
+    )
 
     args = parser.parse_args()
 
@@ -1069,6 +1130,7 @@ def main():
         realization=args.realization,
         rcm=args.rcm,
         region=args.region,
+        overwrite=args.overwrite,
     )
     calc.run()
     logger.info("全部完成。")
