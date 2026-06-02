@@ -1,0 +1,14 @@
+# Python >= 3.10 is recommended
+numpy>=1.23
+pandas>=1.5
+xarray>=2023.1.0
+netCDF4>=1.6.0
+cftime>=1.6.0
+tqdm>=4.64
+rioxarray
+h5py
+matplotlib
+cartopy
+ipykernel
+h5netcdf
+dask
