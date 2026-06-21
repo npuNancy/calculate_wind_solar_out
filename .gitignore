@@ -8,7 +8,7 @@ test.ipynb
 .vscode
 .claude
 
-calculate_bcsd_cfs
+ref_code
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
