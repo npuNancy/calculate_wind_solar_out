@@ -1,5 +1,7 @@
 # Custom
-data/
+data/*
+!data/grid_division
+
 output/
 outputs/
 outputs_0p1deg/
