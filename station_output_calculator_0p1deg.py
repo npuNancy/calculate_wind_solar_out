@@ -160,18 +160,45 @@ def find_cf_file(cfs_dir, source, stype, model, region, scenario):
     return os.path.join(base, candidates[0])
 
 
-def find_cf_file_nam12(cfs_dir, stype, gcm, realization, rcm, scenario):
+def find_cf_files_nam12(cfs_dir, stype, gcm, realization, rcm, scenario, years=None):
+    """查找 NAM-12 CF 文件（按年分文件）。
+
+    目录结构::
+
+        {cfs_dir}/CFs_of_{stype}_NAM-12/{gcm}/{realization}/{scenario}/yearly/
+            {stype}_CF_NAM-12_{gcm}_{realization}_{rcm}_{scenario}_{year}_allmonths.nc
+
+    每个文件含一个模式年（约 Dec(Y-1) → Dec(Y)）的逐小时 CF，因此完整日历年 Y
+    跨文件 Y 与 Y+1。返回**按年份排序的文件路径列表**，找不到返回 ``[]``。
+
+    指定 ``years`` 时仅返回覆盖这些日历年所需的文件（年 Y 需文件 Y 和 Y+1），
+    以减少 IO；未指定则返回全部年份文件。
+    """
     subdir = CF_SUBDIR["nam12"][stype]
-    base = os.path.join(cfs_dir, subdir, gcm, realization)
+    base = os.path.join(cfs_dir, subdir, gcm, realization, scenario, "yearly")
     if not os.path.isdir(base):
-        return None
+        return []
+
+    year_pat = re.compile(r'_(\d{4})_allmonths\.nc$')
+    found = {}
     for f in os.listdir(base):
-        if f.endswith(".nc") and scenario in f and "allmonths" in f and rcm in f:
-            return os.path.join(base, f)
-    for f in os.listdir(base):
-        if f.endswith(".nc") and scenario in f and rcm in f:
-            return os.path.join(base, f)
-    return None
+        if not f.endswith(".nc") or scenario not in f or rcm not in f:
+            continue
+        m = year_pat.search(f)
+        if not m:
+            continue
+        found[int(m.group(1))] = os.path.join(base, f)
+
+    if not found:
+        return []
+
+    if years:
+        wanted = set(years) | {y + 1 for y in years}
+        sel_years = sorted(y for y in found if y in wanted)
+    else:
+        sel_years = sorted(found)
+
+    return [found[y] for y in sel_years]
 
 
 # ---------------------------------------------------------------------------
@@ -412,13 +439,18 @@ class StationOutputCalculator0p1:
 
         for stype in ["solar", "wind"]:
             logger.info(f"===== NAM-12 {stype} =====")
-            cf_path = find_cf_file_nam12(cfs_dir, stype, gcm, realization, rcm, scenario)
-            if cf_path is None:
+            cf_paths = find_cf_files_nam12(
+                cfs_dir, stype, gcm, realization, rcm, scenario, self.years)
+            if not cf_paths:
                 logger.warning(
-                    f"  未找到 NAM-12 CF 文件: {stype}/{gcm}/{realization}/{rcm}/{scenario}"
+                    f"  未找到 NAM-12 CF 文件: "
+                    f"{stype}/{gcm}/{realization}/{scenario}/yearly (rcm={rcm})"
                 )
                 continue
-            logger.info(f"  CF 文件: {cf_path}")
+            logger.info(
+                f"  CF 文件: {len(cf_paths)} 个 "
+                f"[{os.path.basename(cf_paths[0])} … {os.path.basename(cf_paths[-1])}]"
+            )
 
             for country_name in target_countries:
                 if country_name not in self.country_shapes:
@@ -433,7 +465,7 @@ class StationOutputCalculator0p1:
                 if stations.empty:
                     continue
                 logger.info(f"  {country_name}: {len(stations)} 个 {stype} 场站")
-                self._compute_and_save_nam12(cf_path, stations, stype, country_name,
+                self._compute_and_save_nam12(cf_paths, stations, stype, country_name,
                                              gcm, realization, rcm, scenario)
 
     # ------------------------------------------------------------------
@@ -560,85 +592,105 @@ class StationOutputCalculator0p1:
     # 出力计算（NAM-12，旋转极网，最近邻取点）
     # ------------------------------------------------------------------
 
-    def _compute_and_save_nam12(self, cf_path, stations, stype, country_name,
+    def _compute_and_save_nam12(self, cf_paths, stations, stype, country_name,
                                 gcm, realization, rcm, scenario):
-        ds = nc.Dataset(cf_path, "r")
         cf_varname = CF_VARNAME[stype]
 
-        lat2d = ds.variables["lat"][:].astype(np.float64)
-        lon2d = ds.variables["lon"][:].astype(np.float64)
+        # 网格与最近邻索引：各年份文件网格一致，用第一个文件计算一次即可
+        ds0 = nc.Dataset(cf_paths[0], "r")
+        lat2d = ds0.variables["lat"][:].astype(np.float64)
+        lon2d = ds0.variables["lon"][:].astype(np.float64)
+        ds0.close()
         lon2d_180 = lon_to_180(lon2d)
-
-        times_raw = ds.variables["time"][:]
-        time_units = ds.variables["time"].units
-        times_dt = nc.num2date(times_raw, time_units)
-        cf_years = np.array([t.year for t in times_dt], dtype=np.int32)
 
         station_lons_180 = lon_to_180(lon_to_360(stations["lon"].values.astype(np.float64)))
         station_lats = stations["lat"].values.astype(np.float64)
         capacities = stations["capacity_gw"].values.astype(np.float32)
         activation_years = stations["activation_year"].values.astype(np.int32)
-
-        n_time = ds.dimensions["time"].size
         n_stations = len(stations)
 
         rlat_idx, rlon_idx, dist = nearest_index_2d(
             lat2d, lon2d_180, station_lons_180, station_lats)
+        valid_station = dist <= self.max_dist
+
+        # 跨文件汇总时间轴（按年份分文件，逐小时）
+        per_file = []           # (path, n_time, years_array)
+        time_units = None
+        for path in cf_paths:
+            ds = nc.Dataset(path, "r")
+            times_raw = ds.variables["time"][:]
+            tunits = ds.variables["time"].units
+            ds.close()
+            if time_units is None:
+                time_units = tunits
+            times_dt = nc.num2date(times_raw, tunits)
+            yrs = np.array([t.year for t in times_dt], dtype=np.int32)
+            per_file.append((path, len(times_raw), yrs, np.asarray(times_raw)))
+
+        cf_years = np.concatenate([p[2] for p in per_file])
+        all_times = np.concatenate([p[3] for p in per_file])
+        n_time_total = len(cf_years)
 
         n_far = int(np.sum(dist > self.max_dist))
         logger.info(
-            f"  NAM-12: 时间步={n_time}, 场站={n_stations}; "
+            f"  NAM-12: 文件={len(cf_paths)}, 总时间步={n_time_total}, 场站={n_stations}; "
             f"最近邻距离 median={np.median(dist):.4f}° max={dist.max():.4f}°; "
             f"超容差({self.max_dist}°)场站={n_far}"
         )
-        valid_station = dist <= self.max_dist
 
-        # 仅计算指定年份：构建输出时间步映射
+        # 仅计算指定年份：在拼接后的全局时间轴上构建输出时间步映射
         sel = self._select_time_indices(cf_years)
         if sel is not None:
-            logger.info(f"  仅计算年份 {self.years}: 选中 {len(sel)}/{n_time} 个时间步")
+            logger.info(
+                f"  仅计算年份 {self.years}: 选中 {len(sel)}/{n_time_total} 个时间步")
             n_out = len(sel)
-            out_pos = np.full(n_time, -1, dtype=np.int64)
+            out_pos = np.full(n_time_total, -1, dtype=np.int64)
             out_pos[sel] = np.arange(n_out)
         else:
-            n_out = n_time
+            n_out = n_time_total
 
         power = np.full((n_out, n_stations), np.nan, dtype=np.float32)
         chunk_size = 500
-        for t_start in tqdm(range(0, n_time, chunk_size),
-                            desc="  NAM-12 计算出力", unit="chunk"):
-            t_end = min(t_start + chunk_size, n_time)
+        global_off = 0
+        for path, n_time, yrs, _ in per_file:
+            ds = nc.Dataset(path, "r")
+            for t_start in tqdm(range(0, n_time, chunk_size),
+                                desc=f"  NAM-12 {os.path.basename(path)}",
+                                unit="chunk"):
+                t_end = min(t_start + chunk_size, n_time)
+                g_start, g_end = global_off + t_start, global_off + t_end
 
-            if sel is not None:
-                chunk_pos = out_pos[t_start:t_end]
-                keep_local = chunk_pos >= 0
-                if not keep_local.any():
-                    continue
+                if sel is not None:
+                    chunk_pos = out_pos[g_start:g_end]
+                    keep_local = chunk_pos >= 0
+                    if not keep_local.any():
+                        continue
 
-            chunk_years = cf_years[t_start:t_end]
+                chunk_years = yrs[t_start:t_end]
 
-            cf_chunk = ds.variables[cf_varname][t_start:t_end, :, :]
-            cf_chunk = np.ma.filled(cf_chunk.astype(np.float32), np.nan)
+                cf_chunk = ds.variables[cf_varname][t_start:t_end, :, :]
+                cf_chunk = np.ma.filled(cf_chunk.astype(np.float32), np.nan)
 
-            cf_pts = cf_chunk[:, rlat_idx, rlon_idx]   # (chunk, n_stations)
+                cf_pts = cf_chunk[:, rlat_idx, rlon_idx]   # (chunk, n_stations)
 
-            year_ok = chunk_years[:, None] >= activation_years[None, :]
-            cf_pts = np.where(year_ok, cf_pts, np.nan)
-            cf_pts[:, ~valid_station] = np.nan
+                year_ok = chunk_years[:, None] >= activation_years[None, :]
+                cf_pts = np.where(year_ok, cf_pts, np.nan)
+                cf_pts[:, ~valid_station] = np.nan
 
-            block = np.where(
-                np.isnan(cf_pts), np.nan, cf_pts * capacities[None, :]
-            ).astype(np.float32)
+                block = np.where(
+                    np.isnan(cf_pts), np.nan, cf_pts * capacities[None, :]
+                ).astype(np.float32)
 
-            if sel is None:
-                power[t_start:t_end, :] = block
-            else:
-                power[chunk_pos[keep_local], :] = block[keep_local, :]
+                if sel is None:
+                    power[g_start:g_end, :] = block
+                else:
+                    power[chunk_pos[keep_local], :] = block[keep_local, :]
+            ds.close()
+            global_off += n_time
 
-        ds.close()
         self._save_output_nam12(power, stations, stype, country_name,
-                                gcm, realization, rcm, scenario, cf_path, dist,
-                                time_indices=sel)
+                                gcm, realization, rcm, scenario, dist,
+                                all_times, time_units, time_indices=sel)
 
     # ------------------------------------------------------------------
     # 输出
@@ -666,15 +718,18 @@ class StationOutputCalculator0p1:
         return False
 
     def _write_common_vars(self, ds_out, power, stations, cf_path, dist,
-                           time_indices=None):
+                           time_indices=None, times=None, time_units=None):
         """写入维度、坐标、出力等公共变量。
 
         time_indices 非 None 时，仅写入这些时间步（与 power 的时间维一致）。
+        times/time_units 已给定时直接使用（NAM-12 跨多个年份文件拼接），
+        否则从单个 cf_path 读取（BCSD / China）。
         """
-        ds_cf = nc.Dataset(cf_path, "r")
-        times = ds_cf.variables["time"][:]
-        time_units = ds_cf.variables["time"].units
-        ds_cf.close()
+        if times is None:
+            ds_cf = nc.Dataset(cf_path, "r")
+            times = ds_cf.variables["time"][:]
+            time_units = ds_cf.variables["time"].units
+            ds_cf.close()
 
         if time_indices is not None:
             times = times[time_indices]
@@ -744,16 +799,17 @@ class StationOutputCalculator0p1:
             raise
 
     def _save_output_nam12(self, power, stations, stype, country_name,
-                           gcm, realization, rcm, scenario, cf_path, dist,
-                           time_indices=None):
+                           gcm, realization, rcm, scenario, dist,
+                           times, time_units, time_indices=None):
         out_path = self._get_output_path(
             stype, country_name, None, scenario, "nam12",
             gcm=gcm, realization=realization, rcm=rcm)
         logger.info(f"  保存: {out_path}")
         try:
             ds_out = nc.Dataset(out_path, "w", format="NETCDF4")
-            self._write_common_vars(ds_out, power, stations, cf_path, dist,
-                                    time_indices=time_indices)
+            self._write_common_vars(ds_out, power, stations, None, dist,
+                                    time_indices=time_indices,
+                                    times=times, time_units=time_units)
             ds_out.region = country_name
             ds_out.scenario = scenario
             ds_out.source_csv = os.path.basename(self.csv_path)
