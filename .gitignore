@@ -2,6 +2,7 @@
 data/
 output/
 outputs/
+outputs_0p1deg/
 
 test.ipynb
 

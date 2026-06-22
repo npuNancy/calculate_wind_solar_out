@@ -1082,8 +1082,8 @@ python %(prog)s --csv data/stations/stations_SSP5-6.0.csv \\
         help="CF 数据根目录 (默认: data/cfs)",
     )
     parser.add_argument(
-        "--output-dir", default="outputs",
-        help="输出根目录 (默认: outputs)",
+        "--output-dir", default="outputs/outputs_1deg",
+        help="输出根目录 (默认: outputs/outputs_1deg)",
     )
     # NAM-12 专用参数
     parser.add_argument("--gcm", help="NAM-12 GCM 名 (仅 nam12 需要)")
