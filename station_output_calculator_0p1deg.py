@@ -310,6 +310,9 @@ class StationOutputCalculator0p1:
         # 仅计算指定日历年份（如 [2030, 2040, 2050]）；None 表示全部年份
         self.years = sorted(set(years)) if years else None
 
+        # 运行汇总：每条 (region, stype) 的处理结果
+        self.summary = []
+
         self.stations_df = pd.read_csv(csv_path)
         logger.info(
             f"加载场站数据: {len(self.stations_df)} 条记录, 情景={scenario}, "
@@ -333,6 +336,26 @@ class StationOutputCalculator0p1:
 
     # ------------------------------------------------------------------
 
+    # 处理结果状态码 → 中文说明
+    STATUS_DESC = {
+        "ok": "已生成",
+        "no_stations": "跳过：该区域无此类型场站",
+        "no_cf": "跳过：未找到 CF 文件",
+        "exists": "跳过：输出文件已存在",
+        "no_shape": "跳过：shapefile 中无对应边界",
+    }
+
+    def _record(self, region, stype, status, n_stations=0):
+        """记录一条 (region, stype) 的处理结果用于运行汇总。"""
+        self.summary.append({
+            "region": region,
+            "type": stype,
+            "scenario": self.scenario,
+            "model": self.model or self.gcm or "",
+            "status": status,
+            "n_stations": int(n_stations),
+        })
+
     def run(self):
         if self.source == "china":
             self._run_china()
@@ -340,6 +363,53 @@ class StationOutputCalculator0p1:
             self._run_nam12()
         else:
             self._run_bcsd()
+        self._report_summary()
+
+    # ------------------------------------------------------------------
+    # 运行汇总报告
+    # ------------------------------------------------------------------
+
+    def _report_summary(self):
+        """打印运行汇总并写出 CSV 报告。"""
+        if not self.summary:
+            logger.info("运行汇总：无任何处理记录。")
+            return
+
+        df = pd.DataFrame(self.summary)
+        order = ["ok", "no_stations", "no_cf", "exists", "no_shape"]
+        counts = df["status"].value_counts().to_dict()
+
+        # 控制台汇总
+        logger.info("=" * 60)
+        logger.info("运行汇总（按状态统计）:")
+        for st in order:
+            if st in counts:
+                logger.info(f"  {st:<12} {self.STATUS_DESC[st]:<22} : {counts[st]} 条")
+        n_ok_sta = int(df.loc[df["status"] == "ok", "n_stations"].sum())
+        logger.info(f"  生成文件 {counts.get('ok', 0)} 个，合计场站 {n_ok_sta} 个")
+
+        # 重点列出"未生成文件"的组合（最常见的是无场站）
+        missing = df[df["status"] != "ok"].sort_values(["status", "region", "type"])
+        if not missing.empty:
+            logger.info("-" * 60)
+            logger.info("未生成文件的 区域×类型（原因）:")
+            for _, r in missing.iterrows():
+                logger.info(
+                    f"  {r['region']:<22} {r['type']:<6} "
+                    f"{self.STATUS_DESC[r['status']]}"
+                )
+
+        # 写 CSV 报告
+        tag = f"{self.source}_{df['model'].iloc[0]}_{self.scenario}"
+        if self.years:
+            tag += "_" + "-".join(str(y) for y in self.years)
+        report_path = os.path.join(self.output_dir, f"run_summary_{tag}.csv")
+        os.makedirs(self.output_dir, exist_ok=True)
+        df_out = df[["region", "type", "scenario", "model", "status", "n_stations"]].copy()
+        df_out["status_desc"] = df_out["status"].map(self.STATUS_DESC)
+        df_out.to_csv(report_path, index=False)
+        logger.info(f"汇总报告已写出: {report_path}")
+        logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     # BCSD
@@ -371,6 +441,8 @@ class StationOutputCalculator0p1:
         ne_name = bcsd_region_to_ne_name(region)
         if ne_name not in self.country_shapes:
             logger.warning(f"  区域 '{region}' 在 shapefile 中无匹配，跳过")
+            self._record(region, "solar", "no_shape")
+            self._record(region, "wind", "no_shape")
             return
         country_geom = self.country_shapes[ne_name]
 
@@ -379,21 +451,25 @@ class StationOutputCalculator0p1:
             cf_path = find_cf_file(cfs_dir, "bcsd", stype, model, region, scenario)
             if cf_path is None:
                 logger.warning(f"  未找到 CF 文件: {stype}/{model}/{region}/{scenario}")
+                self._record(region, stype, "no_cf")
                 continue
 
             out_path = self._get_output_path(stype, region, model, scenario, "bcsd")
             if self._should_skip(out_path):
+                self._record(region, stype, "exists")
                 continue
 
             logger.info(f"  CF 文件: {cf_path}")
             stations = self._filter_stations_for_country(ne_name, country_geom, stype)
             if stations.empty:
                 logger.info(f"  该国家无 {stype} 场站")
+                self._record(region, stype, "no_stations")
                 continue
             logger.info(f"  共 {len(stations)} 个 {stype} 场站")
 
             self._compute_and_save(cf_path, stations, stype, region, model,
                                    scenario, source="bcsd")
+            self._record(region, stype, "ok", len(stations))
 
     # ------------------------------------------------------------------
     # China
@@ -411,19 +487,23 @@ class StationOutputCalculator0p1:
             logger.info(f"===== China {stype} =====")
             out_path = self._get_output_path(stype, "china", model, scenario, "china")
             if self._should_skip(out_path):
+                self._record("china", stype, "exists")
                 continue
             cf_path = find_cf_file(cfs_dir, "china", stype, model, "china", scenario)
             if cf_path is None:
                 logger.warning(f"  未找到 China CF 文件: {stype}/{model}/{scenario}")
+                self._record("china", stype, "no_cf")
                 continue
             logger.info(f"  CF 文件: {cf_path}")
             stations = self._filter_stations_for_country(ne_name, country_geom, stype)
             if stations.empty:
                 logger.info(f"  中国无 {stype} 场站")
+                self._record("china", stype, "no_stations")
                 continue
             logger.info(f"  共 {len(stations)} 个 {stype} 场站")
             self._compute_and_save(cf_path, stations, stype, "china", model,
                                    scenario, source="china")
+            self._record("china", stype, "ok", len(stations))
 
     # ------------------------------------------------------------------
     # NAM-12
@@ -446,6 +526,8 @@ class StationOutputCalculator0p1:
                     f"  未找到 NAM-12 CF 文件: "
                     f"{stype}/{gcm}/{realization}/{scenario}/yearly (rcm={rcm})"
                 )
+                for country_name in target_countries:
+                    self._record(country_name, stype, "no_cf")
                 continue
             logger.info(
                 f"  CF 文件: {len(cf_paths)} 个 "
@@ -454,19 +536,23 @@ class StationOutputCalculator0p1:
 
             for country_name in target_countries:
                 if country_name not in self.country_shapes:
+                    self._record(country_name, stype, "no_shape")
                     continue
                 out_path = self._get_output_path(
                     stype, country_name, None, scenario, "nam12",
                     gcm=gcm, realization=realization, rcm=rcm)
                 if self._should_skip(out_path):
+                    self._record(country_name, stype, "exists")
                     continue
                 country_geom = self.country_shapes[country_name]
                 stations = self._filter_stations_for_country(country_name, country_geom, stype)
                 if stations.empty:
+                    self._record(country_name, stype, "no_stations")
                     continue
                 logger.info(f"  {country_name}: {len(stations)} 个 {stype} 场站")
                 self._compute_and_save_nam12(cf_paths, stations, stype, country_name,
                                              gcm, realization, rcm, scenario)
+                self._record(country_name, stype, "ok", len(stations))
 
     # ------------------------------------------------------------------
     # 场站筛选（按国家 + 去重 + activation_year）—— 与 1° 版本一致
