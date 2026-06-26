@@ -11,6 +11,8 @@ test.ipynb
 .vscode
 .claude
 
+run_*.sh
+
 ref_code
 
 # Byte-compiled / optimized / DLL files
