@@ -13,6 +13,9 @@ test.ipynb
 
 run_*.sh
 
+# SCNet runtime state is local and generated Slurm scripts live outside the repo.
+scnet/models/*/completion_status/
+
 ref_code
 
 # Byte-compiled / optimized / DLL files

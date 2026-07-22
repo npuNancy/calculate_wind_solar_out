@@ -5,6 +5,9 @@ xarray>=2023.1.0
 netCDF4>=1.6.0
 cftime>=1.6.0
 tqdm>=4.64
+scipy>=1.9
+shapely>=1.8
+pyshp>=2.3
 rioxarray
 h5py
 matplotlib
