@@ -80,6 +80,11 @@ def expanded_path(value: str) -> Path:
     return Path(os.path.abspath(os.path.expanduser(value)))
 
 
+def shell_join(arguments: Sequence[str]) -> str:
+    """兼容 Python 3.6 的 ``shlex.join``。"""
+    return " ".join(shlex.quote(argument) for argument in arguments)
+
+
 def safe_token(value: str, label: str) -> str:
     value = value.strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
@@ -369,7 +374,7 @@ def render_job_script(
             f'echo "[INFO] unit={spec.job_name} source={args.source} '
             f'scenario={spec.scenario}"'
         ),
-        shlex.join(spec.command),
+        shell_join(spec.command),
         f'echo "[STATION_OUTPUT_DONE] unit={spec.job_name}"',
         'echo "[INFO] 完成时间: $(date -Iseconds)"',
         "",
@@ -397,7 +402,7 @@ def create_jobs(args: argparse.Namespace) -> List[Path]:
 
     print(f"计划生成 {len(specs)} 个作业（source={args.source}）")
     for spec in specs:
-        print(f"  {spec.job_name}: {shlex.join(spec.command)}")
+        print(f"  {spec.job_name}: {shell_join(spec.command)}")
     if args.dry_run:
         print("dry-run：未创建目录或脚本")
         return []
