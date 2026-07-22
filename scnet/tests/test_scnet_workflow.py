@@ -154,6 +154,39 @@ class MonitorClassificationTests(unittest.TestCase):
         classification, _ = monitor.classify_unit(unit)
         self.assertEqual(classification, "deterministic_failure")
 
+    def test_combined_progress_contains_required_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = monitor.build_parser().parse_args(
+                [
+                    "--server",
+                    "scnet-wuzhen-199",
+                    "--model",
+                    "CANESM5",
+                    "--status-root",
+                    temporary,
+                    "--once",
+                ]
+            )
+            record = {
+                "server": "scnet-wuzhen-199",
+                "unit_id": "stout_bcsd_CANESM5_ssp126",
+                "source": "bcsd",
+                "model": "CANESM5",
+                "scenario": "ssp126",
+                "job_id": "41094622",
+                "scheduler_state": "PENDING",
+                "classification": "active",
+                "summary": {"exists": False, "rows": 0, "missing_outputs": []},
+                "reason": "Slurm 状态为 PENDING",
+                "observed_at": "2026-07-22T16:00:00+08:00",
+                "next_action": "",
+            }
+            monitor.write_combined_progress(args, "CANESM5", [record], [])
+            progress = Path(temporary, "progress.md").read_text(encoding="utf-8")
+            self.assertIn("Last checked", progress)
+            self.assertIn("stout_bcsd_CANESM5_ssp126", progress)
+            self.assertIn("| Server | Unit ID |", progress)
+
 
 if __name__ == "__main__":
     unittest.main()

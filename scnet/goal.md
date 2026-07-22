@@ -70,14 +70,16 @@ Australia、Brazil 尚未进入 CF 计算阶段。本轮只处理已有区域，
 
 ```text
 completion_status/
+├── progress.md
 ├── <SERVER>/<UNIT_ID>.json
 ├── latest_<SERVER>.json
 └── progress_<SERVER>.md
 ```
 
 监控器默认每 1800 秒检查一次，服务器通过 `--server` 在运行时指定，不写死在
-代码中。它只采集、分类和报告；失败后的判断和操作由 Agent（Codex CLI 或
-Claude Code）完成。
+代码中。每次检查后都会原子更新统一的 `progress.md` 表，即使状态没有变化。
+它只采集、分类和报告；失败后的判断和操作由 Agent（Codex CLI 或 Claude Code）
+完成。
 
 ## 5. 本地与远程边界
 

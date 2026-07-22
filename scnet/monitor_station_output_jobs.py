@@ -483,17 +483,21 @@ def atomic_write_text(path: Path, content: str) -> None:
             temporary.unlink()
 
 
+def status_root_path(args: argparse.Namespace, identity: str) -> Path:
+    return (
+        Path(args.status_root).expanduser().resolve()
+        if args.status_root
+        else args.repository_root / "scnet" / "models" / identity / "completion_status"
+    )
+
+
 def write_status(
     args: argparse.Namespace,
     identity: str,
     server: str,
     payload: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], bool]:
-    status_root = (
-        Path(args.status_root).expanduser().resolve()
-        if args.status_root
-        else args.repository_root / "scnet" / "models" / identity / "completion_status"
-    )
+    status_root = status_root_path(args, identity)
     observed_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     records: list[dict[str, Any]] = []
     has_error = bool(
@@ -565,12 +569,82 @@ def write_status(
     return records, has_error
 
 
+def write_combined_progress(
+    args: argparse.Namespace,
+    identity: str,
+    records: list[dict[str, Any]],
+    monitor_errors: list[tuple[str, str]],
+) -> None:
+    """按技能进度契约更新统一的 ``completion_status/progress.md``。"""
+    checked_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    counts: dict[str, int] = {}
+    for record in records:
+        classification = record["classification"]
+        counts[classification] = counts.get(classification, 0) + 1
+    total = len(records) + len(monitor_errors)
+    lines = [
+        "# SCNet 场站出力作业进度",
+        "",
+        f"- Last checked: `{checked_at}`",
+        f"- Total: `{total}`",
+        f"- Not submitted: `{counts.get('not_submitted', 0)}`",
+        f"- Active: `{counts.get('active', 0)}`",
+        f"- Succeeded: `{counts.get('succeeded', 0)}`",
+        "- Retryable/resource failure: "
+        f"`{counts.get('retryable', 0) + counts.get('resource_failure', 0)}`",
+        "- Deterministic/incomplete: "
+        f"`{counts.get('deterministic_failure', 0) + counts.get('incomplete_output', 0)}`",
+        f"- Monitor error/unknown: `{len(monitor_errors) + counts.get('unknown', 0)}`",
+        "",
+        "| Server | Unit ID | Source | Model | Scenario | Job ID | Slurm state | "
+        "Classification | Output evidence | Reason | Updated at | Next action |",
+        "|---|---|---|---|---|---:|---|---|---|---|---|---|",
+    ]
+    for record in sorted(records, key=lambda item: (item["server"], item["scenario"])):
+        summary = record.get("summary", {})
+        evidence = (
+            f"summary={summary.get('exists', False)}, "
+            f"rows={summary.get('rows', 0)}, "
+            f"missing={len(summary.get('missing_outputs', []))}"
+        )
+        lines.append(
+            "| {server} | {unit_id} | {source} | {model} | {scenario} | {job_id} | "
+            "{scheduler_state} | {classification} | {evidence} | {reason} | "
+            "{observed_at} | {next_action} |".format(
+                evidence=evidence,
+                **record,
+            )
+        )
+    for server, reason in sorted(monitor_errors):
+        lines.append(
+            f"| {server} | monitor | {args.source} | {args.model or args.gcm} | - | - | "
+            f"- | unknown | query failed | {reason} | {checked_at} | 等待 Agent 判断 |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "",
+            "- 每行对应一个独立 SSP 作业单元；本表在每次完整检查后原子更新。",
+            "- 监控器只记录和报告，不提交、取消、重试或修改远程输出。",
+            "",
+        ]
+    )
+    atomic_write_text(
+        status_root_path(args, identity) / "progress.md",
+        "\n".join(lines),
+    )
+
+
 def check_once(args: argparse.Namespace, identity: str) -> bool:
     any_error = False
+    all_records: list[dict[str, Any]] = []
+    monitor_errors: list[tuple[str, str]] = []
     for server in args.server:
         try:
             payload = query_server(args, server)
             records, has_error = write_status(args, identity, server, payload)
+            all_records.extend(records)
             any_error = any_error or has_error
             print(f"[{server}] {len(records)} 个作业单元")
             for record in records:
@@ -585,7 +659,9 @@ def check_once(args: argparse.Namespace, identity: str) -> bool:
                 )
         except Exception as exc:
             any_error = True
+            monitor_errors.append((server, str(exc)))
             print(f"[{server}] 监控失败：{exc}", file=sys.stderr)
+    write_combined_progress(args, identity, all_records, monitor_errors)
     return any_error
 
 
