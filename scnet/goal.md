@@ -72,8 +72,7 @@ Australia、Brazil 尚未进入 CF 计算阶段。本轮只处理已有区域，
 completion_status/
 ├── progress.md
 ├── <SERVER>/<UNIT_ID>.json
-├── latest_<SERVER>.json
-└── progress_<SERVER>.md
+└── latest_<SERVER>.json
 ```
 
 监控器默认每 1800 秒检查一次，服务器通过 `--server` 在运行时指定，不写死在

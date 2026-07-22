@@ -551,21 +551,6 @@ def write_status(
         status_root / f"latest_{suffix}.json",
         json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
     )
-    lines = [
-        f"# {server} / {args.source} / {args.model or args.gcm}",
-        "",
-        f"检查时间：{observed_at}",
-        "",
-        "| 单元 | Job ID | Slurm | 分类 | 原因 |",
-        "|---|---:|---|---|---|",
-    ]
-    for record in records:
-        lines.append(
-            "| {unit_id} | {job_id} | {scheduler_state} | {classification} | {reason} |".format(
-                **record
-            )
-        )
-    atomic_write_text(status_root / f"progress_{suffix}.md", "\n".join(lines) + "\n")
     return records, has_error
 
 
