@@ -401,6 +401,8 @@ class StationOutputCalculator0p1:
 
         # 写 CSV 报告
         tag = f"{self.source}_{df['model'].iloc[0]}_{self.scenario}"
+        if self.region:
+            tag += f"_{self.region}"
         if self.years:
             tag += "_" + "-".join(str(y) for y in self.years)
         report_path = os.path.join(self.output_dir, f"run_summary_{tag}.csv")

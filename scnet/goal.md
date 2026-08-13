@@ -22,8 +22,8 @@
 | 科学入口 | `python station_output_calculator_0p1deg.py --csv <CSV> --source <SOURCE> ...` |
 | 默认数据源 | `bcsd` |
 | 并行轴 | SSP；不同模式可以作为不同 campaign 独立运行 |
-| 作业单位 | 一个 `source × model/GCM identity × SSP` |
-| 作业内共享轴 | 程序按既有顺序串行处理该 SSP 的全部可见国家，以及 solar、wind |
+| 作业单位 | 默认一个 `source × model/GCM identity × SSP`；传 `--regions <R1> <R2> …` 时为 `source × model × SSP × region`，每作业内仍串行 solar+wind |
+| 作业内共享轴 | 程序按既有顺序串行处理该作业的全部可见区域（或单一指定区域），以及 solar、wind |
 | 依赖 | 对应 SSP 的 stations CSV、CF 目录、Natural Earth shapefile |
 | DAG | 无；三个 SSP 作业相互独立 |
 | 输出 | 默认位于 `<PROJECT_DIR>/outputs/outputs_0p1deg/` |
@@ -38,6 +38,20 @@ stations_SSP1-2.6.csv → ssp126
 stations_SSP2-4.5.csv → ssp245
 stations_SSP5-6.0.csv → ssp585
 ```
+
+按区域拆分（例如补跑新增 CF 区域时）传入 `--regions <R1> <R2> …`，为每个
+`(SSP × region)` 生成独立作业，每个作业内部仍串行 solar+wind。此时 job_name、
+作业脚本名和 `run_summary_*.csv` 文件名都带 region 后缀，避免同 SSP 不同区域
+的汇总文件互相覆盖：
+
+```text
+--regions India Australia Brazil  →  9 个作业
+stout_bcsd_CANESM5_ssp126_India / … / stout_bcsd_CANESM5_ssp585_Brazil
+run_summary_bcsd_CANESM5_ssp126_India.csv / …
+```
+
+`--regions` 与单值 `--region`（透传单一区域、生成 1 作业）互斥。同一 campaign
+期间生成器与监控器的 region 字符串必须完全一致，否则 job_name 不匹配。
 
 生成的 BCSD 科学命令等价于：
 
@@ -159,7 +173,8 @@ source /work/home/acbpgywfpz/miniconda3/bin/activate climate
 $HOME/.bcsd_submit.lock
 ```
 
-本 campaign 只有三个作业，不需要自动补槽。
+本 campaign 默认只有三个作业；按区域拆分时为 9 个作业（3 SSP × 3 region），
+仍远低于 20 上限，不需要自动补槽。每次 `sbatch` 前重新计数的规则不变。
 
 ## 8. 生成和本地验证
 
@@ -178,6 +193,13 @@ python3 scnet/create_station_output_jobs.py \
 
 python3 scnet/create_station_output_jobs.py \
   --source nam12 --gcm '<GCM>' --realization '<REALIZATION>' --rcm '<RCM>'
+```
+
+按区域拆分（例如补跑 India/Australia/Brazil）：
+
+```bash
+python3 scnet/create_station_output_jobs.py \
+  --model '<MODEL>' --regions India Australia Brazil
 ```
 
 每次生成后检查：
@@ -224,6 +246,14 @@ python3 scnet/monitor_station_output_jobs.py \
 ```bash
 python3 scnet/monitor_station_output_jobs.py \
   --server '<SSH_HOST>' --model '<MODEL>' --interval 1800
+```
+
+按区域拆分时监控（region 字符串须与生成器 `--regions` 完全一致）：
+
+```bash
+python3 scnet/monitor_station_output_jobs.py \
+  --server '<SSH_HOST>' --model '<MODEL>' \
+  --regions India Australia Brazil --once
 ```
 
 完成状态允许：

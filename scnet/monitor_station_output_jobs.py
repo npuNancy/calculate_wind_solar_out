@@ -48,6 +48,7 @@ import json
 import os
 import re
 import subprocess
+import unicodedata
 from pathlib import Path
 
 
@@ -76,6 +77,14 @@ def normalize_state(value):
 def job_number(value):
     match = re.match(r"^(\d+)", value)
     return int(match.group(1)) if match else -1
+
+
+def region_token(value):
+    """把 region 名归并为与生成器 job_token 同语义的 ASCII 标识。"""
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", ascii_value).strip("-._")
+    return token
 
 
 def tail(path, max_lines=30, max_chars=12000):
@@ -128,11 +137,13 @@ def expected_output(args, row, scenario, output_root):
     )
 
 
-def check_summary(args, scenario, project_dir, output_root):
+def check_summary(args, scenario, region, project_dir, output_root):
     identity = args.gcm if args.source == "nam12" else args.model
-    summary = output_root / (
-        "run_summary_" + args.source + "_" + identity + "_" + scenario + ".csv"
-    )
+    summary_name = "run_summary_" + args.source + "_" + identity + "_" + scenario
+    if region:
+        summary_name += "_" + region
+    summary_name += ".csv"
+    summary = output_root / summary_name
     result = {
         "path": str(summary),
         "exists": summary.is_file(),
@@ -193,6 +204,7 @@ parser.add_argument("--logs-dir", required=True)
 parser.add_argument("--output-dir", required=True)
 parser.add_argument("--history-start", required=True)
 parser.add_argument("--scenarios", nargs="+", required=True)
+parser.add_argument("--regions", nargs="*", default=[])
 args = parser.parse_args()
 
 project_dir = Path(os.path.expanduser(args.project_dir)).resolve()
@@ -202,10 +214,14 @@ if not output_root.is_absolute():
     output_root = project_dir / output_root
 output_root = output_root.resolve()
 identity = args.gcm if args.source == "nam12" else args.model
-job_names = {
-    scenario: "stout_{}_{}_{}".format(args.source, identity, scenario)
-    for scenario in args.scenarios
-}
+regions = args.regions or [None]
+job_names = {}
+for scenario in args.scenarios:
+    for region in regions:
+        name = "stout_{}_{}_{}".format(args.source, identity, scenario)
+        if region is not None:
+            name += "_" + region_token(region)
+        job_names[(scenario, region)] = name
 
 squeue = run([
     "squeue", "-h", "-u", getpass.getuser(),
@@ -271,26 +287,28 @@ for collection in (active_by_name, accounting_by_name):
 
 units = []
 for scenario in args.scenarios:
-    job_name = job_names[scenario]
-    scheduler = active_by_name.get(job_name) or accounting_by_name.get(job_name)
-    job_id = scheduler.get("job_id", "") if scheduler else ""
-    stdout_path = logs_dir / (job_name + "_" + job_id + ".out") if job_id else None
-    stderr_path = logs_dir / (job_name + "_" + job_id + ".err") if job_id else None
-    stdout_tail = tail(stdout_path) if stdout_path else ""
-    stderr_tail = tail(stderr_path) if stderr_path else ""
-    units.append(
-        {
-            "scenario": scenario,
-            "job_name": job_name,
-            "scheduler": scheduler,
-            "summary": check_summary(args, scenario, project_dir, output_root),
-            "stdout_path": str(stdout_path) if stdout_path else "",
-            "stderr_path": str(stderr_path) if stderr_path else "",
-            "stdout_tail": stdout_tail,
-            "stderr_tail": stderr_tail,
-            "done_marker": "[STATION_OUTPUT_DONE]" in stdout_tail,
-        }
-    )
+    for region in regions:
+        job_name = job_names[(scenario, region)]
+        scheduler = active_by_name.get(job_name) or accounting_by_name.get(job_name)
+        job_id = scheduler.get("job_id", "") if scheduler else ""
+        stdout_path = logs_dir / (job_name + "_" + job_id + ".out") if job_id else None
+        stderr_path = logs_dir / (job_name + "_" + job_id + ".err") if job_id else None
+        stdout_tail = tail(stdout_path) if stdout_path else ""
+        stderr_tail = tail(stderr_path) if stderr_path else ""
+        units.append(
+            {
+                "scenario": scenario,
+                "region": region or "",
+                "job_name": job_name,
+                "scheduler": scheduler,
+                "summary": check_summary(args, scenario, region, project_dir, output_root),
+                "stdout_path": str(stdout_path) if stdout_path else "",
+                "stderr_path": str(stderr_path) if stderr_path else "",
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "done_marker": "[STATION_OUTPUT_DONE]" in stdout_tail,
+            }
+        )
 
 print(json.dumps({
     "remote_home": str(Path.home()),
@@ -345,6 +363,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="需要监控的情景（默认：ssp126 ssp245 ssp585）",
     )
     parser.add_argument(
+        "--regions",
+        nargs="*",
+        default=[],
+        help=(
+            "按区域拆分时监控的区域列表（须与生成器 --regions 一致）；"
+            "默认空=退化为 3 SSP 全区域模式"
+        ),
+    )
+    parser.add_argument(
         "--project-dir",
         default="~/calculate_wind_solar_out",
         help="远程仓库目录",
@@ -390,6 +417,11 @@ def validate_args(args: argparse.Namespace) -> str:
         safe_token(scenario, "scenario")
     if len(set(args.scenarios)) != len(args.scenarios):
         raise ValueError("scenarios 不能重复")
+    if len(set(args.regions)) != len(args.regions):
+        raise ValueError("regions 不能重复")
+    for region in args.regions:
+        if not region.strip():
+            raise ValueError("regions 不能包含空值")
     return identity
 
 
@@ -410,6 +442,8 @@ def remote_arguments(args: argparse.Namespace, history_start: str) -> list[str]:
         "--scenarios",
         *args.scenarios,
     ]
+    if args.regions:
+        values.extend(("--regions", *args.regions))
     for name in ("model", "gcm", "realization", "rcm"):
         value = getattr(args, name)
         if value:
@@ -514,6 +548,7 @@ def write_status(
             "source": args.source,
             "model": args.model or args.gcm,
             "scenario": unit["scenario"],
+            "region": unit.get("region", ""),
             "job_id": (unit.get("scheduler") or {}).get("job_id", ""),
             "scheduler_state": (unit.get("scheduler") or {}).get("state", ""),
             "exit_code": (unit.get("scheduler") or {}).get("exit_code", ""),
@@ -581,19 +616,24 @@ def write_combined_progress(
         f"`{counts.get('deterministic_failure', 0) + counts.get('incomplete_output', 0)}`",
         f"- Monitor error/unknown: `{len(monitor_errors) + counts.get('unknown', 0)}`",
         "",
-        "| Server | Unit ID | Source | Model | Scenario | Job ID | Slurm state | "
+        "| Server | Unit ID | Source | Model | Scenario | Region | Job ID | Slurm state | "
         "Classification | Output evidence | Reason | Updated at | Next action |",
-        "|---|---|---|---|---|---:|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---:|---|---|---|---|---|---|",
     ]
-    for record in sorted(records, key=lambda item: (item["server"], item["scenario"])):
+    for record in sorted(
+        records,
+        key=lambda item: (item["server"], item["scenario"], item.get("region", "")),
+    ):
         summary = record.get("summary", {})
         evidence = (
             f"summary={summary.get('exists', False)}, "
             f"rows={summary.get('rows', 0)}, "
             f"missing={len(summary.get('missing_outputs', []))}"
         )
+        record = {**record, "region": record.get("region", "")}
         lines.append(
-            "| {server} | {unit_id} | {source} | {model} | {scenario} | {job_id} | "
+            "| {server} | {unit_id} | {source} | {model} | {scenario} | {region} | "
+            "{job_id} | "
             "{scheduler_state} | {classification} | {evidence} | {reason} | "
             "{observed_at} | {next_action} |".format(
                 evidence=evidence,
@@ -602,7 +642,7 @@ def write_combined_progress(
         )
     for server, reason in sorted(monitor_errors):
         lines.append(
-            f"| {server} | monitor | {args.source} | {args.model or args.gcm} | - | - | "
+            f"| {server} | monitor | {args.source} | {args.model or args.gcm} | - | - | - | "
             f"- | unknown | query failed | {reason} | {checked_at} | 等待 Agent 判断 |"
         )
     lines.extend(
@@ -610,7 +650,7 @@ def write_combined_progress(
             "",
             "## Notes",
             "",
-            "- 每行对应一个独立 SSP 作业单元；本表在每次完整检查后原子更新。",
+            "- 每行对应一个独立作业单元（SSP，或 SSP × region）；本表在每次完整检查后原子更新。",
             "- 监控器只记录和报告，不提交、取消、重试或修改远程输出。",
             "",
         ]

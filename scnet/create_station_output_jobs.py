@@ -59,6 +59,7 @@ class JobSpec(NamedTuple):
     job_name: str
     script_path: Path
     command: Tuple[str, ...]
+    region: Optional[str] = None
 
 
 def positive_int(value: str) -> int:
@@ -178,6 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rcm", help="NAM-12 RCM 名")
     parser.add_argument("--region", help="BCSD 单一区域；默认由程序串行处理全部区域")
     parser.add_argument(
+        "--regions",
+        nargs="+",
+        default=None,
+        metavar="REGION",
+        help=(
+            "按区域拆分：为每个 (SSP × region) 生成独立作业，命令带 "
+            "--region <REGION>。默认不启用（保持全区域串行的 3 SSP 作业）。"
+            "与 --region 互斥。"
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="把 --overwrite 传给科学入口；生产默认关闭",
@@ -251,6 +263,13 @@ def validate_args(args: argparse.Namespace) -> None:
             "生产作业不允许 --years：科学入口的输出文件名不含年份，"
             "不同年份选择会发生路径冲突"
         )
+    if args.region and args.regions:
+        raise ValueError(
+            "--region 与 --regions 互斥：--region 透传单一区域（1 作业），"
+            "--regions 按区域循环生成多作业"
+        )
+    if args.regions:
+        unique_values(args.regions, "regions")
     if args.source in {"bcsd", "china"} and not args.model:
         raise ValueError(f"{args.source} 数据源需要 --model")
     if args.source == "nam12":
@@ -274,6 +293,7 @@ def build_scientific_command(
     *,
     csv_argument: str,
     explicit_scenario: Optional[str],
+    region_override: Optional[str] = None,
 ) -> Tuple[str, ...]:
     command = [
         args.python_executable,
@@ -293,10 +313,13 @@ def build_scientific_command(
         command.extend(("--cfs-dir", args.cfs_dir))
     if args.output_dir != DEFAULT_OUTPUT_DIR:
         command.extend(("--output-dir", args.output_dir))
-    for name in ("gcm", "realization", "rcm", "region"):
+    for name in ("gcm", "realization", "rcm"):
         value = getattr(args, name)
         if value:
             command.extend((f"--{name}", value))
+    region_value = region_override if region_override is not None else args.region
+    if region_value:
+        command.extend(("--region", region_value))
     if args.overwrite:
         command.append("--overwrite")
     if args.max_dist != DEFAULT_MAX_DIST:
@@ -318,6 +341,9 @@ def create_plan(args: argparse.Namespace) -> Tuple[List[JobSpec], Path, Path, Pa
 
     csv_values = unique_values(args.csv, "csv")
     identity = scientific_identity(args)
+    region_values: List[Optional[str]] = [None]
+    if args.regions:
+        region_values = list(unique_values(args.regions, "regions"))
     specs = []  # type: List[JobSpec]
     seen_scenarios = set()  # type: Set[str]
     seen_names = set()  # type: Set[str]
@@ -331,17 +357,24 @@ def create_plan(args: argparse.Namespace) -> Tuple[List[JobSpec], Path, Path, Pa
             raise ValueError(f"多个 CSV 推断为同一情景，会发生作业冲突：{scenario}")
         seen_scenarios.add(scenario)
 
-        job_name = job_token(f"stout_{args.source}_{identity}_{scenario}")
-        if job_name in seen_names:
-            raise ValueError(f"作业名冲突：{job_name}")
-        seen_names.add(job_name)
-        script_path = jobs_dir / f"{job_name}.sh"
-        command = build_scientific_command(
-            args,
-            csv_argument=csv_argument,
-            explicit_scenario=args.scenario,
-        )
-        specs.append(JobSpec(csv_argument, scenario, job_name, script_path, command))
+        for region in region_values:
+            name_base = f"stout_{args.source}_{identity}_{scenario}"
+            if region is not None:
+                name_base += f"_{region}"
+            job_name = job_token(name_base)
+            if job_name in seen_names:
+                raise ValueError(f"作业名冲突：{job_name}")
+            seen_names.add(job_name)
+            script_path = jobs_dir / f"{job_name}.sh"
+            command = build_scientific_command(
+                args,
+                csv_argument=csv_argument,
+                explicit_scenario=args.scenario,
+                region_override=region,
+            )
+            specs.append(
+                JobSpec(csv_argument, scenario, job_name, script_path, command, region)
+            )
     return specs, project_dir, logs_dir, conda_activate
 
 
@@ -372,7 +405,7 @@ def render_job_script(
         'echo "[INFO] 节点: ${SLURMD_NODENAME:-$(hostname)}"',
         (
             f'echo "[INFO] unit={spec.job_name} source={args.source} '
-            f'scenario={spec.scenario}"'
+            f'scenario={spec.scenario} region={spec.region or "-"}"'
         ),
         shell_join(spec.command),
         f'echo "[STATION_OUTPUT_DONE] unit={spec.job_name}"',
